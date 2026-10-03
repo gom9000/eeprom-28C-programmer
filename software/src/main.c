@@ -45,13 +45,21 @@ static int parseHex(const char *str, unsigned int *value)
     return 0;
 }
 
-/* getopt optional arguments must be attached (-w100): also accept "-w 100" */
-static const char *optionalArg(int argc, char **argv)
+/*
+ * getopt optional arguments must be attached (-w100): also accept "-w 100".
+ * The optional LENGTH of -w/-v must start with a decimal digit (e.g. 0A0):
+ * this way "-wa" or "-vf FILE" are rejected instead of being read as the
+ * hex lengths 0xA and 0xF.
+ */
+static const char *optionalArg(int argc, char **argv, int *bad)
 {
-    unsigned int dummy;
-
-    if (optarg) return optarg;
-    if (optind < argc && argv[optind][0] != '-' && !parseHex(argv[optind], &dummy))
+    *bad = 0;
+    if (optarg)
+    {
+        if (!isdigit((unsigned char)optarg[0])) *bad = 1;
+        return optarg;
+    }
+    if (optind < argc && isdigit((unsigned char)argv[optind][0]))
         return argv[optind++];
     return NULL;
 }
@@ -64,7 +72,7 @@ static void usage(const char *prog)
     printf("    -t <LENGTH> [-s <START>] [-z <BLANK>]\n");
     printf("    \ttest if rom is filled with BLANK data values\n");
     printf("    -d <LENGTH> [-s <START>] [-f <DATAFILE>] [-a]\n");
-    printf("    \tdump LENGTH bytes of rom, starting from START address, into DATAFILE (stdout: always ascii)\n");
+    printf("    \tdump LENGTH bytes of rom, starting from START address, into DATAFILE (stdout: always ascii, with addresses)\n");
     printf("    -e <LENGTH> [-s <START>] [-z <BLANK>] [-b <PAGESIZE>]\n");
     printf("    \terase LENGTH bytes (filled with BLANK values) of rom, starting from START address\n");
     printf("    -v [<LENGTH>] [-s <START>] [-f <DATAFILE>] [-a]\n");
@@ -76,12 +84,13 @@ static void usage(const char *prog)
     printf("    -l <MODE>\n");
     printf("    \tenable (MODE=1) or disable (MODE=0) rom Software Data Protection\n");
     printf("    -h: show this help and exit\n");
-    printf("  params (LENGTH, START and BLANK are hex values):\n");
+    printf("  only one of -t, -d, -e, -v, -w, -l can be given\n");
+    printf("  params (LENGTH, START, BLANK and PAGESIZE are hex values; the optional LENGTH of -v/-w must start with a digit, e.g. 0A0):\n");
     printf("    -s <START> set the start hex address, default value is 0x0\n");
     printf("    -f <DATAFILE> set the datafile where to dump/read values, default is stdout (dump) or stdin (write/verify)\n");
     printf("    -z <BLANK> set the blank hex data value to fill/test the rom, default value is 0xFF\n");
     printf("    -b <PAGESIZE> enable page write mode with PAGESIZE hex bytes (40 for 28C64/28C256), default is byte mode\n");
-    printf("    -a set the mode of the datafile as ascii hex (default mode is binary)\n");
+    printf("    -a set the mode of the datafile as ascii hex (default mode is binary); \"XXXXX:\" address labels are skipped\n");
     printf("    -p show the value of input params and bus pin numbers\n");
     printf("  exit status: 0 on success, 1 on error or verify/test mismatch\n");
 }
@@ -96,17 +105,52 @@ static FILE *openFile(const char *filename, const char *mode, FILE *dflt)
     return fp;
 }
 
-/* read next byte from datafile; returns 1 on success, 0 on EOF/parse error */
+static int hexDigit(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    c = toupper((unsigned char)c);
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/*
+ * Read next byte from datafile; returns 1 on success, 0 on EOF, -1 on error.
+ * Ascii files are whitespace separated tokens of hex digit pairs ("A1C4..."
+ * or "A1 C4 ..."); tokens ending with ':' are address labels and are skipped,
+ * so the stdout dump format can be read back as well.
+ */
 static int readByte(FILE *fp, unsigned char ascii, data_t *data)
 {
-    if (ascii)
+    static char token[257]; /* even max width: pairs are never split */
+    static size_t pos = 0, len = 0;
+
+    if (!ascii)
     {
-        unsigned int value;
-        if (fscanf(fp, "%2X", &value) != 1) return 0;
-        *data = (data_t)value;
-        return 1;
+        if (fread(data, sizeof(data_t), 1, fp) == 1) return 1;
+        if (ferror(fp)) { perror("datafile"); return -1; }
+        return 0;
     }
-    return fread(data, sizeof(data_t), 1, fp) == 1;
+
+    while (pos >= len)
+    {
+        if (fscanf(fp, "%256s", token) != 1)
+        {
+            if (ferror(fp)) { perror("datafile"); return -1; }
+            return 0;
+        }
+        len = strlen(token);
+        pos = 0;
+        if (token[len-1] == ':') { len = 0; continue; } /* address label */
+        for (size_t ii=0; ii<len; ii++)
+            if (hexDigit(token[ii]) < 0 || len % 2)
+            {
+                fprintf(stderr, "Invalid ascii hex data `%s' in datafile.\n", token);
+                return -1;
+            }
+    }
+    *data = (data_t)(hexDigit(token[pos]) << 4 | hexDigit(token[pos+1]));
+    pos += 2;
+    return 1;
 }
 
 
@@ -127,10 +171,13 @@ int main(int argc, char **argv)
     unsigned int zerobyte = 0xFF;
     unsigned int pagesize = 1;
     const char *arg;
+    int bad;
+    int rc;
     char *filename = NULL;
     FILE *fp;
 
 
+    opterr = 0; /* errors are reported below */
     while ((c = getopt(argc, argv, "s:f:z:b:t:d:e:w::v::l:aph")) != -1)
     {
         switch (c)
@@ -169,10 +216,12 @@ int main(int argc, char **argv)
                 if (c == 'e') e_flag = 1;
                 if (c == 'w') w_flag = 1;
                 if (c == 'v') v_flag = 1;
-                arg = (c == 'w' || c == 'v')? optionalArg(argc, argv) : optarg;
-                if (arg && (parseHex(arg, &length) || length > ROM_MAX_SIZE))
+                bad = 0;
+                arg = (c == 'w' || c == 'v')? optionalArg(argc, argv, &bad) : optarg;
+                if (arg && (bad || parseHex(arg, &length) || length > ROM_MAX_SIZE))
                 {
-                    fprintf(stderr, "Invalid LENGTH `%s' (max %X).\n", arg, ROM_MAX_SIZE);
+                    fprintf(stderr, "Invalid LENGTH `%s' for -%c (hex, max %X%s).\n", arg, c, ROM_MAX_SIZE,
+                            (bad? "; an attached LENGTH must start with a digit, no other options can follow -w/-v in a group" : ""));
                     return 1;
                 }
                 break;
@@ -212,9 +261,22 @@ int main(int argc, char **argv)
         }
     }
 
+    if (optind < argc)
+    {
+        unsigned int dummy;
+        fprintf(stderr, "Unexpected argument `%s' (%s).\n", argv[optind],
+                parseHex(argv[optind], &dummy)? "use -f <DATAFILE> for the datafile"
+                                               : "the LENGTH of -v/-w must start with a digit, e.g. 0A0");
+        return 1;
+    }
     if (!(t_flag || d_flag || e_flag || w_flag || v_flag || l_flag || p_flag))
     {
         usage(argv[0]);
+        return 1;
+    }
+    if (t_flag + d_flag + e_flag + w_flag + v_flag + l_flag > 1)
+    {
+        fprintf(stderr, "Only one of -t, -d, -e, -v, -w, -l can be given.\n");
         return 1;
     }
     if (start + length > ROM_MAX_SIZE)
@@ -279,20 +341,37 @@ int main(int argc, char **argv)
         static data_t buf[ROM_MAX_SIZE];
         length_t count = 0;
         length_t total;
+        rc = 0;
         length_t errors;
         length_t maxlen = length? length : ROM_MAX_SIZE - start;
 
         if (!(fp = openFile(filename, a_flag? "r" : "rb", stdin))) return 1;
-        while (count < maxlen && readByte(fp, a_flag, &buf[count]))
+        while (count < maxlen && (rc = readByte(fp, a_flag, &buf[count])) == 1)
             count++;
         if (fp != stdin) fclose(fp);
+        if (rc < 0)
+        {
+            fprintf(stderr, "write aborted, datafile error after 0x%X bytes: ROM not modified.\n", count);
+            return 1;
+        }
+        if (!count && !length)
+        {
+            fprintf(stderr, "write aborted, datafile is empty.\n");
+            return 1;
+        }
         total = length? length : count;
         for (length_t ii=count; ii<total; ii++) buf[ii] = (data_t)zerobyte;
 
         printf("Writing ROM with contents of %s file: %s from start 0x%X (%s mode)...\n",
                (a_flag? "ascii" : "binary"), (filename? filename : "stdin"), start,
                (pagesize > 1? "page" : "byte"));
+        if (pagesize > 1) piHiPri(50); /* fewer preemptions during page loads (needs root) */
         errors = programROM(start, buf, total, pagesize);
+        if (!errors && (errors = verifyROM(start, buf, total)))
+        {
+            printf("write error, final verify found 0x%X locations differing.\n", errors);
+            return 1;
+        }
         if (!errors)
         {
             printf("0x%X locations of ROM written", count);
@@ -314,10 +393,11 @@ int main(int argc, char **argv)
         data_t actual = 0;
         length_t maxlen = length? length : ROM_MAX_SIZE - start;
 
+        rc = 0;
         if (!(fp = openFile(filename, a_flag? "r" : "rb", stdin))) return 1;
         printf("Verifying ROM with contents of %s file: %s from start 0x%X...\n",
                (a_flag? "ascii" : "binary"), (filename? filename : "stdin"), start);
-        while (address < maxlen && readByte(fp, a_flag, &data))
+        while (address < maxlen && (rc = readByte(fp, a_flag, &data)) == 1)
         {
             actual = readROM(start+address);
             if (data != actual)
@@ -329,6 +409,11 @@ int main(int argc, char **argv)
             address++;
         }
         if (fp != stdin) fclose(fp);
+        if (rc < 0)
+        {
+            printf("verify error, datafile error after 0x%X locations.\n", address);
+            return 1;
+        }
         if (!address)
         {
             printf("verify error, datafile is empty.\n");

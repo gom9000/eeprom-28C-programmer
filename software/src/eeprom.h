@@ -9,7 +9,7 @@
  *
  * Author.....: Alessandro Fraschetti (mail: gos95@gommagomma.net)
  * Target.....: RaspberryPI
- * Version....: 1.2 2026/10/03
+ * Version....: 1.3 2026/10/03
  * Description: EEPROM 28C-family programmer utility
  * URL........: https://github.com/gom9000/xp-eeprom-28C-programmer
  * License....: this program is under the terms of MIT License
@@ -53,6 +53,7 @@ void writeROM(address_t, data_t);
 int waitForWriteCycle(address_t, data_t);
 length_t programROM(address_t, const data_t*, length_t, length_t);
 length_t eraseROM(address_t, length_t, data_t, length_t);
+length_t verifyROM(address_t, const data_t*, length_t);
 length_t testROM(address_t, length_t, data_t);
 void dumpROM(address_t, length_t, FILE*, unsigned char);
 void setSDPMode(unsigned char);

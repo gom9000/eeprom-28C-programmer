@@ -9,7 +9,7 @@
  *
  * Author.....: Alessandro Fraschetti (mail: gos95@gommagomma.net)
  * Target.....: RaspberryPI
- * Version....: 1.2 2026/10/03
+ * Version....: 1.3 2026/10/03
  * Description: EEPROM 28C-family programmer utility
  * URL........: https://github.com/gom9000/xp-eeprom-28C-programmer
  * License....: this program is under the terms of MIT License
@@ -114,26 +114,37 @@ void writeROM(address_t address, data_t data)
 }
 
 /*
- * Wait for the end of the internal write cycle using DATA polling: while the
- * cycle is in progress, a read returns the complement of bit 7 of the last
- * written byte; at the end it returns the true data.
+ * Wait for the end of the internal write cycle.
+ * DATA polling: while the cycle is in progress, a read of the last written
+ * byte returns the complement of its bit 7. It is reliable only on that
+ * address: if a page load was split (e.g. the process was preempted for more
+ * than tBLC) the polled location may not be the one being written. So the
+ * cycle is considered over only when bit 7 matches AND two consecutive reads
+ * return the same value (Toggle Bit: I/O6 toggles on every read during the
+ * cycle, on any address).
  * Returns 0 if the location holds the expected data, -1 on timeout/mismatch
  * (e.g. Software Data Protection enabled: the write is ignored).
  */
 int waitForWriteCycle(address_t address, data_t data)
 {
     unsigned int t0;
+    data_t prev, curr;
 
     /* the write cycle starts only when the byte/page load window (tBLC, 150us)
      * expires after the last WE rising edge: polling earlier reads old data */
     delayMicroseconds(TBLC_WAIT_US);
     t0 = micros();
 
-    while ((readROM(address) & 0x80) != (data & 0x80))
-        if (micros() - t0 > WRITE_TIMEOUT_US) return -1;
-
-    /* D7 may become valid slightly before D0-D6: read again the whole byte */
-    return (readROM(address) == data)? 0 : -1;
+    prev = readROM(address);
+    for (;;)
+    {
+        curr = readROM(address);
+        if (curr == prev && (curr & 0x80) == (data & 0x80))
+            return (curr == data)? 0 : -1;
+        if (micros() - t0 > WRITE_TIMEOUT_US)
+            return -1;
+        prev = curr;
+    }
 }
 
 /*
@@ -193,6 +204,16 @@ length_t eraseROM(address_t start, length_t length, data_t blank, length_t pages
     return errors;
 }
 
+/* Return the number of locations in [start, start+length) that differ from buf */
+length_t verifyROM(address_t start, const data_t *buf, length_t length)
+{
+    length_t count = 0;
+    for (length_t ii=0; ii<length; ii++)
+        if (readROM(start+ii) != buf[ii]) count++;
+
+    return count;
+}
+
 length_t testROM(address_t start, length_t length, data_t data)
 {
     length_t count = 0;
@@ -243,5 +264,7 @@ void setSDPMode(unsigned char mode)
         writeROM(0x2AAA, 0x55);
         writeROM(0x5555, 0x20);
     }
-    delay(10); /* wait for the internal write cycle to complete */
+    /* the cycle starts tBLC after the last load and lasts up to tWC (10ms) */
+    delayMicroseconds(TBLC_WAIT_US);
+    delay(10);
 }
